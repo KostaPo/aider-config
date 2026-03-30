@@ -1,0 +1,108 @@
+# ============================================================
+# docker-compose.yml — единый файл для llama.cpp и aider
+#
+# Запуск инфраструктуры: docker compose up llama -d
+# Aider запускается через скрипты ask.sh, agent-files.sh и тд —
+# не напрямую через compose.
+#
+# Переменные берутся из env файлов переданных через --env-file:
+#   aider-agent/env.local      — локальная LLM
+#   aider-agent/env.openrouter — OpenRouter
+# ============================================================
+
+services:
+
+  # --- Локальная LLM ---
+  # Поднимается один раз и работает постоянно (restart: unless-stopped)
+  # Aider обращается к ней по имени сервиса внутри docker сети llama-net
+  llama:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: llama-qwen
+    restart: unless-stopped
+    ports:
+      # Проброс наружу — для диагностики с хоста: curl http://localhost:1234/health
+      - "1234:8080"
+    volumes:
+      # Модели хранятся на хосте — не копируются в образ
+      - ~/.lmstudio/models:/models
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    command: >
+      --model /models/unsloth/Qwen3.5-35B-A3B-GGUF/Qwen3.5-35B-A3B-UD-Q6_K_XL.gguf
+      --no-mmproj
+      --host 0.0.0.0
+      -c 131072
+      --gpu-layers 99
+      --n-cpu-moe 32
+      --threads 12
+      --threads-batch 12
+      --flash-attn on
+      --parallel 1
+      --batch-size 2048
+      --ubatch-size 2048
+      --cache-type-k f16
+      --cache-type-v f16
+      --defrag-thold 0.5
+      --jinja
+      --metrics
+      --reasoning-budget 0
+    networks:
+      - llama-net
+    healthcheck:
+      # /health возвращает 200 только когда модель полностью загружена в VRAM
+      # Aider не стартует пока healthcheck не пройдёт (depends_on: service_healthy)
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s      # проверять каждые 15 сек
+      timeout: 5s        # считать failed если нет ответа за 5 сек
+      retries: 20        # 20 попыток = ~5 минут на загрузку модели в VRAM
+      start_period: 30s  # первые 30 сек не считать failed — идёт инициализация CUDA
+
+  # --- Aider агент ---
+  # Не запускается постоянно — создаётся на время задачи через:
+  #   docker compose run --rm --no-deps aider
+  # --rm  удаляет контейнер после завершения
+  # --no-deps не поднимает зависимости (llama считается уже запущенной)
+  aider:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: aider-agent:latest
+    container_name: aider-agent
+    extra_hosts:
+      # Позволяет обращаться к хосту по имени host.docker.internal
+      # На Linux не работает автоматически — нужна эта строка
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Проект с хоста монтируется в контейнер —
+      # агент видит и меняет реальные файлы на диске
+      - ${PROJECT_PATH}:/project
+    environment:
+      # Для локальной LLM: OPENAI_API_BASE + OPENAI_API_KEY
+      # Для OpenRouter:    OPENROUTER_API_KEY
+      # Пустые переменные aider игнорирует
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_API_BASE=${OPENAI_API_BASE}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      # Git identity — коммиты будут подписаны как агент, не как ты
+      # В git log будет видно что изменения сделал агент
+      - GIT_AUTHOR_NAME=aider-agent
+      - GIT_AUTHOR_EMAIL=agent@local
+      - GIT_COMMITTER_NAME=aider-agent
+      - GIT_COMMITTER_EMAIL=agent@local
+    stdin_open: true
+    tty: true
+    working_dir: /project
+    networks:
+      - llama-net
+    depends_on:
+      llama:
+        # Aider стартует только после того как llama прошла healthcheck —
+        # модель загружена в VRAM и готова принимать запросы
+        condition: service_healthy
+
+networks:
+  llama-net:
+    # Единая сеть для llama и aider —
+    # позволяет aider обращаться к llama по имени сервиса: http://llama:8080
+    name: llama-net
